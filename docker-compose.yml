@@ -1,0 +1,141 @@
+services:
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: admin
+      POSTGRES_DB: lakehouse
+    ports: ["5432:5432"]
+    volumes: ["pg_data:/var/lib/postgresql/data"]
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports: ["9000:9000","9001:9001"]
+    volumes: ["minio_data:/data"]
+
+  createbuckets:
+    image: minio/mc:latest
+    depends_on: ["minio"]
+    entrypoint: >
+      /bin/sh -c "
+      until (/usr/bin/mc alias set local http://minio:9000 minioadmin minioadmin) do echo '...waiting for minio...' && sleep 1; done;
+      /usr/bin/mc mb local/raw || true;
+      /usr/bin/mc mb local/bronze || true;
+      /usr/bin/mc mb local/silver || true;
+      /usr/bin/mc mb local/gold || true;
+      exit 0;
+      "
+
+  mlflow:
+    image: python:3.10-slim
+    working_dir: /mlflow
+    environment:
+      MLFLOW_TRACKING_URI: file:/mlruns
+    volumes:
+      - mlruns:/mlruns
+    command: >
+      sh -c "pip install --no-cache-dir mlflow==2.14.3 && 
+             python -m mlflow server --backend-store-uri file:/mlruns --default-artifact-root file:/mlruns --host 0.0.0.0 --port 5001"
+    ports: ["5001:5001"]
+
+  api:
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+    environment:
+      DATABASE_URL: postgresql+psycopg2://admin:admin@postgres:5432/lakehouse
+    depends_on: ["postgres"]
+    volumes:
+      - ./data:/data
+      - ./ml:/ml
+      - mlruns:/mlruns
+    ports: ["8000:8000"]
+
+  tools:
+    image: python:3.10-slim
+    working_dir: /
+    volumes:
+      - ./requirements.txt:/requirements.txt
+      - ./scripts:/scripts
+      - ./data:/data
+      - ./ml:/ml
+      - ./spark_jobs:/spark_jobs
+      - ./configs:/configs
+    command: sh -c "pip install --no-cache-dir -r /requirements.txt && tail -f /dev/null"
+
+
+  # Hardened Spark container; sets user.home and ivy dir to absolute path
+  spark:
+    image: bitnami/spark:3.5.1
+    volumes:
+      - ./spark_jobs:/spark_jobs
+      - ./ivy2:/ivy2
+    environment:
+      - SPARK_USER=spark
+      - _JAVA_OPTIONS=-Dspark.jars.ivy=/ivy2
+    entrypoint: sleep
+    command: infinity
+
+  spark-submit:
+    image: bitnami/spark:3.5.1
+    volumes:
+      - ./spark_jobs:/spark_jobs
+      - ./ivy2:/ivy2
+    environment:
+      - SPARK_USER=spark
+      - _JAVA_OPTIONS=-Dspark.jars.ivy=/ivy2
+    entrypoint: ["spark-submit"]
+
+
+
+  airflow:
+    build:
+      context: ./airflow
+      dockerfile: Dockerfile
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://admin:admin@postgres:5432/airflow
+      AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+      _AIRFLOW_WWW_USER_USERNAME: admin
+      _AIRFLOW_WWW_USER_PASSWORD: admin
+    depends_on: ["postgres"]
+    ports: ["8080:8080"]
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./spark_jobs:/opt/airflow/spark_jobs
+      - ./data:/data
+      - ./ml:/ml
+    command: >
+      bash -lc "
+      airflow db migrate &&
+      airflow users create --username admin --password admin --firstname Admin --lastname User --role Admin --email admin@example.com || true &&
+      airflow webserver -p 8080 &
+      airflow scheduler
+      "
+
+  superset:
+    image: apache/superset:3.1.2
+    depends_on: ["postgres"]
+    environment:
+      SUPERSET_SECRET_KEY: this_is_not_secure_change_me
+      SUPERSET_LOAD_EXAMPLES: "no"
+    volumes:
+      - superset_home:/app/superset_home
+    ports: ["8088:8088"]
+    command: >
+      /bin/bash -lc "
+      superset fab create-admin --username admin --firstname Admin --lastname User --email admin@superset.local --password admin || true &&
+      superset db upgrade &&
+      superset init &&
+      gunicorn -w 2 -k gevent --timeout 120 --limit-request-line 0 --limit-request-field_size 0 -b 0.0.0.0:8088 'superset.app:create_app()'
+      "
+
+volumes:
+  pg_data:
+  minio_data:
+  mlruns:
+  superset_home:
